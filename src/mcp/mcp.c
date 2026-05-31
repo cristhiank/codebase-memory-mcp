@@ -3868,59 +3868,77 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
 
 /* ── manage_adr ───────────────────────────────────────────────── */
 
-/* ADR "sections" mode: list markdown headers from file. */
-static void adr_list_sections(yyjson_mut_doc *doc, yyjson_mut_val *root_obj, const char *adr_path) {
+/* ADR "sections" mode: list markdown headers ('#'-prefixed lines) from the
+ * ADR content string. */
+static void adr_list_sections_from_content(yyjson_mut_doc *doc, yyjson_mut_val *root_obj,
+                                           const char *content) {
     yyjson_mut_val *sections = yyjson_mut_arr(doc);
-    FILE *fp = fopen(adr_path, "r");
-    if (fp) {
-        char line[CBM_SZ_1K];
-        while (fgets(line, sizeof(line), fp)) {
-            if (line[0] == '#') {
-                size_t len = strlen(line);
-                while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-                    line[--len] = '\0';
-                }
-                yyjson_mut_arr_add_strcpy(doc, sections, line);
-            }
+    const char *p = content;
+    while (p && *p) {
+        const char *eol = strchr(p, '\n');
+        size_t linelen = eol ? (size_t)(eol - p) : strlen(p);
+        while (linelen > 0 && p[linelen - SKIP_ONE] == '\r') {
+            linelen--;
         }
-        (void)fclose(fp);
+        if (linelen > 0 && p[0] == '#') {
+            char hdr[CBM_SZ_1K];
+            if (linelen >= sizeof(hdr)) {
+                linelen = sizeof(hdr) - SKIP_ONE;
+            }
+            memcpy(hdr, p, linelen);
+            hdr[linelen] = '\0';
+            yyjson_mut_arr_add_strcpy(doc, sections, hdr);
+        }
+        if (!eol) {
+            break;
+        }
+        p = eol + SKIP_ONE;
     }
     yyjson_mut_obj_add_val(doc, root_obj, "sections", sections);
 }
 
-/* ADR "get" mode: read content from file. Returns heap buffer (caller frees
- * AFTER serialization since yyjson borrows the pointer). */
-static char *adr_read_content(yyjson_mut_doc *doc, yyjson_mut_val *root_obj, const char *adr_path) {
-    FILE *fp = fopen(adr_path, "r");
-    if (fp) {
-        (void)fseek(fp, 0, SEEK_END);
-        long sz = ftell(fp);
-        if (sz < 0) {
-            sz = 0;
-        }
-        (void)fseek(fp, 0, SEEK_SET);
-        char *buf = malloc((size_t)sz + SKIP_ONE);
-        size_t n = (sz > 0) ? fread(buf, SKIP_ONE, (size_t)sz, fp) : 0;
-        if (n > (size_t)sz) {
-            n = (size_t)sz;
-        }
-        buf[n] = '\0';
-        (void)fclose(fp);
-        yyjson_mut_obj_add_str(doc, root_obj, "content", buf);
-        return buf;
+/* Read the legacy file-based ADR (<root>/.codebase-memory/adr.md), used by
+ * older versions. Returns a heap buffer (caller frees) or NULL if missing/
+ * empty. Kept only to migrate old ADRs into the store (#256). */
+static char *adr_read_legacy_file(const char *root_path) {
+    if (!root_path) {
+        return NULL;
     }
-    yyjson_mut_obj_add_str(doc, root_obj, "content", "");
-    yyjson_mut_obj_add_str(doc, root_obj, "status", "no_adr");
-    yyjson_mut_obj_add_str(
-        doc, root_obj, "adr_hint",
-        "No ADR yet. Create one with manage_adr(mode='update', "
-        "content='## PURPOSE\\n...\\n\\n## STACK\\n...\\n\\n## ARCHITECTURE\\n..."
-        "\\n\\n## PATTERNS\\n...\\n\\n## TRADEOFFS\\n...\\n\\n## PHILOSOPHY\\n...'). "
-        "For guided creation: explore the codebase with get_architecture, "
-        "then draft and store. Sections: PURPOSE, STACK, ARCHITECTURE, "
-        "PATTERNS, TRADEOFFS, PHILOSOPHY.");
-    return NULL;
+    char adr_path[CBM_SZ_4K];
+    snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory/adr.md", root_path);
+    FILE *fp = fopen(adr_path, "r");
+    if (!fp) {
+        return NULL;
+    }
+    (void)fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    if (sz <= 0) {
+        (void)fclose(fp);
+        return NULL;
+    }
+    (void)fseek(fp, 0, SEEK_SET);
+    char *buf = malloc((size_t)sz + SKIP_ONE);
+    if (!buf) {
+        (void)fclose(fp);
+        return NULL;
+    }
+    size_t n = fread(buf, SKIP_ONE, (size_t)sz, fp);
+    buf[n] = '\0';
+    (void)fclose(fp);
+    if (buf[0] == '\0') {
+        free(buf);
+        return NULL;
+    }
+    return buf;
 }
+
+#define ADR_EMPTY_HINT                                                             \
+    "No ADR yet. Create one with manage_adr(mode='update', "                       \
+    "content='## PURPOSE\\n...\\n\\n## STACK\\n...\\n\\n## ARCHITECTURE\\n..."     \
+    "\\n\\n## PATTERNS\\n...\\n\\n## TRADEOFFS\\n...\\n\\n## PHILOSOPHY\\n...'). " \
+    "For guided creation: explore the codebase with get_architecture, "            \
+    "then draft and store. Sections: PURPOSE, STACK, ARCHITECTURE, "               \
+    "PATTERNS, TRADEOFFS, PHILOSOPHY."
 
 static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     char *project = cbm_mcp_get_string_arg(args, "project");
@@ -3931,47 +3949,64 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
         mode_str = heap_strdup("get");
     }
 
-    char *root_path = get_project_root(srv, project);
-    if (!root_path) {
+    /* ADRs are stored in the SQLite store (project_summaries), the SAME
+     * backend the UI /api/adr endpoints use — so writes via the MCP tool and
+     * the UI are visible to each other (#256). */
+    cbm_store_t *store = resolve_store(srv, project);
+    if (!store) {
         free(project);
         free(mode_str);
         free(content);
         return cbm_mcp_text_result("project not found", true);
     }
 
-    char adr_dir[CBM_SZ_4K];
-    snprintf(adr_dir, sizeof(adr_dir), "%s/.codebase-memory", root_path);
-    char adr_path[CBM_SZ_4K];
-    snprintf(adr_path, sizeof(adr_path), "%s/adr.md", adr_dir);
+    /* One-time migration: older versions wrote ADRs to a file at
+     * <root>/.codebase-memory/adr.md. If the store has no ADR yet but that
+     * legacy file exists, import it so nothing is lost on upgrade. */
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    bool have_adr = (cbm_store_adr_get(store, project, &adr) == CBM_STORE_OK);
+    if (!have_adr) {
+        char *root_path = get_project_root(srv, project);
+        char *legacy = adr_read_legacy_file(root_path);
+        free(root_path);
+        if (legacy) {
+            if (cbm_store_adr_store(store, project, legacy) == CBM_STORE_OK) {
+                have_adr = (cbm_store_adr_get(store, project, &adr) == CBM_STORE_OK);
+            }
+            free(legacy);
+        }
+    }
 
-    char *adr_buf = NULL;
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root_obj);
 
     bool is_error = false;
-    if (strcmp(mode_str, "update") == 0 && content) {
-        cbm_mkdir(adr_dir);
-        FILE *fp = fopen(adr_path, "w");
-        if (fp) {
-            (void)fputs(content, fp);
-            (void)fclose(fp);
+    if ((strcmp(mode_str, "update") == 0 || strcmp(mode_str, "store") == 0) && content) {
+        if (cbm_store_adr_store(store, project, content) == CBM_STORE_OK) {
             yyjson_mut_obj_add_str(doc, root_obj, "status", "updated");
         } else {
             yyjson_mut_obj_add_str(doc, root_obj, "status", "write_error");
-            yyjson_mut_obj_add_str(doc, root_obj, "error", strerror(errno));
             is_error = true;
         }
     } else if (strcmp(mode_str, "sections") == 0) {
-        adr_list_sections(doc, root_obj, adr_path);
-    } else {
-        adr_buf = adr_read_content(doc, root_obj, adr_path);
+        adr_list_sections_from_content(doc, root_obj, have_adr ? adr.content : NULL);
+    } else { /* get */
+        if (have_adr && adr.content) {
+            yyjson_mut_obj_add_strcpy(doc, root_obj, "content", adr.content);
+        } else {
+            yyjson_mut_obj_add_str(doc, root_obj, "content", "");
+            yyjson_mut_obj_add_str(doc, root_obj, "status", "no_adr");
+            yyjson_mut_obj_add_str(doc, root_obj, "adr_hint", ADR_EMPTY_HINT);
+        }
     }
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
-    free(adr_buf);
-    free(root_path);
+    if (have_adr) {
+        cbm_store_adr_free(&adr);
+    }
     free(project);
     free(mode_str);
     free(content);
