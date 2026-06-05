@@ -161,7 +161,10 @@ static char *extract_callee_from_fields(CBMArena *a, TSNode node, const char *so
             strcmp(fk, "field_expression") == 0 || strcmp(fk, "dot") == 0 ||
             strcmp(fk, "function") == 0 || strcmp(fk, "dotted_identifier") == 0 ||
             strcmp(fk, "member_access_expression") == 0 || strcmp(fk, "scoped_identifier") == 0 ||
-            strcmp(fk, "qualified_identifier") == 0) {
+            strcmp(fk, "qualified_identifier") == 0 ||
+            /* ReScript: call_expression `function` field is a value_identifier
+             * (or value_identifier_path for module-qualified calls). */
+            strcmp(fk, "value_identifier") == 0 || strcmp(fk, "value_identifier_path") == 0) {
             return cbm_node_text(a, func_node, source);
         }
         // R member call: module$fn() — function node is an extract_operator
@@ -324,10 +327,169 @@ static char *extract_erlang_callee(CBMArena *a, TSNode node, const char *source,
     return cbm_node_text(a, ts_node_child(node, 0), source);
 }
 
+// Lisp dialects: a call is a list (`list` / `list_lit`) whose head (first named
+// child) is the function symbol (`symbol` / `sym_lit`). Generic field/first-child
+// extraction misses it because the head is not an `identifier` node.
+static char *extract_lisp_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "list") != 0 && strcmp(nk, "list_lit") != 0) {
+        return NULL;
+    }
+    if (ts_node_named_child_count(node) > 0) {
+        TSNode head = ts_node_named_child(node, 0);
+        const char *hk = ts_node_type(head);
+        if (strcmp(hk, "symbol") == 0 || strcmp(hk, "sym_lit") == 0 ||
+            strcmp(hk, "identifier") == 0) {
+            return cbm_node_text(a, head, source);
+        }
+    }
+    return NULL;
+}
+
+// F#: application_expression head is a long_identifier_or_op wrapper, not a bare
+// identifier, so extract_fp_callee's accepted-type list would miss it.
+static char *extract_fsharp_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "application_expression") != 0 || ts_node_named_child_count(node) == 0) {
+        return NULL;
+    }
+    TSNode head = ts_node_named_child(node, 0);
+    const char *hk = ts_node_type(head);
+    if (strcmp(hk, "long_identifier_or_op") == 0 || strcmp(hk, "long_identifier") == 0 ||
+        strcmp(hk, "identifier") == 0) {
+        return cbm_node_text(a, head, source);
+    }
+    return NULL;
+}
+
+// PowerShell: a `command` node's callee is its `command_name` child.
+static char *extract_powershell_callee(CBMArena *a, TSNode node, const char *source,
+                                       const char *nk) {
+    if (strcmp(nk, "command") != 0) {
+        return NULL;
+    }
+    uint32_t n = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode c = ts_node_named_child(node, i);
+        if (strcmp(ts_node_type(c), "command_name") == 0) {
+            return cbm_node_text(a, c, source);
+        }
+    }
+    return NULL;
+}
+
+// Ada: procedure_call_statement / function_call carry the callee in a `name` field.
+static char *extract_ada_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "procedure_call_statement") != 0 && strcmp(nk, "function_call") != 0) {
+        return NULL;
+    }
+    TSNode name = ts_node_child_by_field_name(node, TS_FIELD("name"));
+    if (!ts_node_is_null(name)) {
+        return cbm_node_text(a, name, source);
+    }
+    if (ts_node_named_child_count(node) > 0) {
+        TSNode head = ts_node_named_child(node, 0);
+        const char *hk = ts_node_type(head);
+        if (strcmp(hk, "name") == 0 || strcmp(hk, "identifier") == 0) {
+            return cbm_node_text(a, head, source);
+        }
+    }
+    return NULL;
+}
+
+// Solidity: a call_expression's first named child is the callee.
+static char *extract_solidity_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "call_expression") != 0 && strcmp(nk, "call") != 0) {
+        return NULL;
+    }
+    if (ts_node_named_child_count(node) > 0) {
+        TSNode head = ts_node_named_child(node, 0);
+        const char *hk = ts_node_type(head);
+        if (strcmp(hk, "identifier") == 0 || strcmp(hk, "member_expression") == 0) {
+            return cbm_node_text(a, head, source);
+        }
+    }
+    return NULL;
+}
+
+// Groovy: function_call's first named child is the callee identifier (the generic
+// first-child fallback misses it because child 0 is anonymous).
+static char *extract_groovy_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "function_call") != 0 && strcmp(nk, "juxt_function_call") != 0) {
+        return NULL;
+    }
+    if (ts_node_named_child_count(node) > 0) {
+        TSNode head = ts_node_named_child(node, 0);
+        if (strcmp(ts_node_type(head), "identifier") == 0) {
+            return cbm_node_text(a, head, source);
+        }
+    }
+    return NULL;
+}
+
+// WGSL: callee is nested type_constructor_or_function_call_expression ->
+// type_declaration -> identifier. Descend left-most until an identifier.
+static char *extract_wgsl_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "type_constructor_or_function_call_expression") != 0) {
+        return NULL;
+    }
+    TSNode head = node;
+    while (ts_node_named_child_count(head) > 0 && strcmp(ts_node_type(head), "identifier") != 0) {
+        head = ts_node_named_child(head, 0);
+    }
+    if (strcmp(ts_node_type(head), "identifier") == 0) {
+        return cbm_node_text(a, head, source);
+    }
+    return NULL;
+}
+
+// Dart: the invocation `selector` (the `(...)` part) follows the callee
+// identifier as a sibling; `new_expression`'s first named child is the type.
+static char *extract_dart_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "selector") == 0) {
+        TSNode prev = ts_node_prev_named_sibling(node);
+        if (!ts_node_is_null(prev) && strcmp(ts_node_type(prev), "identifier") == 0) {
+            return cbm_node_text(a, prev, source);
+        }
+        return NULL;
+    }
+    if (strcmp(nk, "new_expression") == 0 && ts_node_named_child_count(node) > 0) {
+        TSNode head = ts_node_named_child(node, 0);
+        const char *hk = ts_node_type(head);
+        if (strcmp(hk, "identifier") == 0 || strcmp(hk, "type_identifier") == 0) {
+            return cbm_node_text(a, head, source);
+        }
+    }
+    return NULL;
+}
+
 static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *source,
                                           CBMLanguage lang) {
     const char *nk = ts_node_type(node);
 
+    if (lang == CBM_LANG_CLOJURE || lang == CBM_LANG_COMMONLISP || lang == CBM_LANG_SCHEME ||
+        lang == CBM_LANG_FENNEL || lang == CBM_LANG_RACKET || lang == CBM_LANG_EMACSLISP) {
+        return extract_lisp_callee(a, node, source, nk);
+    }
+    if (lang == CBM_LANG_FSHARP) {
+        return extract_fsharp_callee(a, node, source, nk);
+    }
+    if (lang == CBM_LANG_POWERSHELL) {
+        return extract_powershell_callee(a, node, source, nk);
+    }
+    if (lang == CBM_LANG_ADA) {
+        return extract_ada_callee(a, node, source, nk);
+    }
+    if (lang == CBM_LANG_SOLIDITY) {
+        return extract_solidity_callee(a, node, source, nk);
+    }
+    if (lang == CBM_LANG_GROOVY) {
+        return extract_groovy_callee(a, node, source, nk);
+    }
+    if (lang == CBM_LANG_WGSL) {
+        return extract_wgsl_callee(a, node, source, nk);
+    }
+    if (lang == CBM_LANG_DART) {
+        return extract_dart_callee(a, node, source, nk);
+    }
     if (lang == CBM_LANG_OBJC) {
         return extract_objc_callee(a, node, source, nk);
     }
